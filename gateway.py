@@ -299,32 +299,127 @@ class GatewayHandler(BaseHTTPRequestHandler):
             # 9. Parse OpenRouter response
 
             try:
-
                 result = json.loads(raw)
-
-                choices = result["choices"]
-
-                if not isinstance(choices, list) or not choices:
-                    raise ValueError("Missing choices")
-
-                message = choices[0]["message"]
-                response_text = message["content"]
-
-                if (
-                    not isinstance(response_text, str)
-                    or not 0 < len(response_text.encode("utf-8")) <= 65536
-                ):
-                    raise ValueError("Invalid response content")
-
-            except (ValueError, KeyError, TypeError, IndexError):
-
-                logger.error("Invalid provider response structure")
-
+            except Exception:
+                logger.error("Failed to parse provider response as JSON")
                 self.send_json(
                     502,
-                    {"error": "Invalid model response"},
+                    {"error": "Invalid JSON from model provider"},
                 )
                 return
+
+            if not isinstance(result, dict):
+                logger.error(
+                    "Provider JSON is not an object: type=%s",
+                    type(result).__name__,
+                )
+                self.send_json(
+                    502,
+                    {"error": "Invalid provider response structure"},
+                )
+                return
+
+            # Check if provider returned an error payload inside the body
+            if "error" in result:
+                err = result.get("error")
+                err_code = err.get("code") if isinstance(err, dict) else None
+                err_msg = (
+                    err.get("message", "unknown")
+                    if isinstance(err, dict)
+                    else str(err)
+                )
+                logger.error(
+                    "Provider error in payload: code=%s message=%s",
+                    err_code,
+                    err_msg[:200],
+                )
+                self.send_json(
+                    502,
+                    {"error": "Model provider returned an error"},
+                )
+                return
+
+            choices = result.get("choices")
+            if not isinstance(choices, list) or not choices:
+                logger.error(
+                    "Missing or empty choices in provider response: top_keys=%s",
+                    list(result.keys()),
+                )
+                self.send_json(
+                    502,
+                    {"error": "Missing choices in model response"},
+                )
+                return
+
+            first_choice = choices[0]
+            if not isinstance(first_choice, dict):
+                logger.error(
+                    "First choice is not an object: type=%s",
+                    type(first_choice).__name__,
+                )
+                self.send_json(
+                    502,
+                    {"error": "Invalid choice structure in model response"},
+                )
+                return
+
+            finish_reason = first_choice.get("finish_reason")
+            message = first_choice.get("message")
+
+            if not isinstance(message, dict):
+                legacy_text = first_choice.get("text")
+                if isinstance(legacy_text, str) and legacy_text.strip():
+                    response_text = legacy_text.strip()
+                else:
+                    logger.error(
+                        "Choice missing message object: choice_keys=%s finish_reason=%s",
+                        list(first_choice.keys()),
+                        finish_reason,
+                    )
+                    self.send_json(
+                        502,
+                        {"error": "Missing message in model choice"},
+                    )
+                    return
+            else:
+                raw_content = message.get("content")
+                has_reasoning = bool(message.get("reasoning")) or ("reasoning" in message)
+                message_keys = list(message.keys())
+
+                response_text = None
+                if isinstance(raw_content, str):
+                    cleaned = raw_content.strip()
+                    if cleaned:
+                        response_text = cleaned
+                elif isinstance(raw_content, list):
+                    # Handle array of content blocks e.g. [{"type": "text", "text": "..."}]
+                    text_parts = []
+                    for block in raw_content:
+                        if isinstance(block, dict):
+                            if block.get("type") == "text" and isinstance(block.get("text"), str):
+                                text_parts.append(block["text"])
+                            elif "text" in block and isinstance(block["text"], str):
+                                text_parts.append(block["text"])
+                        elif isinstance(block, str):
+                            text_parts.append(block)
+                    combined = "".join(text_parts).strip()
+                    if combined:
+                        response_text = combined
+
+                if not response_text or len(response_text.encode("utf-8")) > 65536:
+                    logger.error(
+                        "No valid text in message: top_keys=%s msg_keys=%s content_type=%s finish_reason=%s has_reasoning=%s",
+                        list(result.keys()),
+                        message_keys,
+                        type(raw_content).__name__,
+                        finish_reason,
+                        has_reasoning,
+                    )
+                    self.send_json(
+                        502,
+                        {"error": "No valid model response text"},
+                    )
+                    return
 
             # 10. Normalize usage
 
