@@ -406,7 +406,20 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     if combined:
                         response_text = combined
 
-                if not response_text or len(response_text.encode("utf-8")) > 65536:
+                # Support reasoning text fallback for reasoning models (e.g. DeepSeek v4.1 Flash)
+                # where content may be null/empty while reasoning contains the generated response.
+                if not response_text and isinstance(message.get("reasoning"), str):
+                    cleaned_reasoning = message["reasoning"].strip()
+                    if cleaned_reasoning:
+                        logger.info("Using reasoning fallback for model response text")
+                        response_text = cleaned_reasoning
+
+                if response_text:
+                    encoded = response_text.encode("utf-8")
+                    if len(encoded) > 65536:
+                        response_text = encoded[:65500].decode("utf-8", errors="ignore")
+
+                if not response_text:
                     logger.error(
                         "No valid text in message: top_keys=%s msg_keys=%s content_type=%s finish_reason=%s has_reasoning=%s",
                         list(result.keys()),
