@@ -1,3 +1,7 @@
+"""
+Workshop Parts Desk LLM Gateway
+Implements the competition model relay protocol for OpenRouter/OpenAI-compatible backends.
+"""
 
 import hmac
 import json
@@ -5,6 +9,8 @@ import logging
 import os
 import socket
 import sys
+import time
+import uuid
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import (
@@ -38,6 +44,154 @@ class NoRedirect(HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+# --------------------------------------------------
+# Response Extraction Helper
+# --------------------------------------------------
+
+def extract_model_output(result, logger_instance=logger, req_id=""):
+    """
+    Extracts (response_text, usage, error_reason) from an OpenRouter/OpenAI-compatible result dictionary.
+    Returns:
+        response_text: Valid nonempty string or None
+        usage: Normalized usage dict with integer input_tokens, output_tokens, total_tokens
+        error_reason: None if successful, or string describing why extraction failed
+    """
+    if not isinstance(result, dict):
+        if logger_instance:
+            logger_instance.error("[%s] Provider JSON is not an object: type=%s", req_id, type(result).__name__)
+        return None, {}, "Invalid provider response structure"
+
+    # Check if provider returned an error payload inside the body
+    if "error" in result:
+        err = result.get("error")
+        err_code = err.get("code") if isinstance(err, dict) else None
+        err_msg = (
+            err.get("message", "unknown")
+            if isinstance(err, dict)
+            else str(err)
+        )
+        if logger_instance:
+            logger_instance.error(
+                "[%s] Provider error in payload: code=%s message=%s",
+                req_id,
+                err_code,
+                err_msg[:200],
+            )
+        return None, {}, "Model provider returned an error"
+
+    choices = result.get("choices")
+    if not isinstance(choices, list) or not choices:
+        if logger_instance:
+            logger_instance.error(
+                "[%s] Missing or empty choices in provider response: top_keys=%s",
+                req_id,
+                list(result.keys()),
+            )
+        return None, {}, "Missing choices in model response"
+
+    first_choice = choices[0]
+    if not isinstance(first_choice, dict):
+        if logger_instance:
+            logger_instance.error(
+                "[%s] First choice is not an object: type=%s",
+                req_id,
+                type(first_choice).__name__,
+            )
+        return None, {}, "Invalid choice structure in model response"
+
+    finish_reason = first_choice.get("finish_reason")
+    message = first_choice.get("message")
+
+    response_text = None
+    if not isinstance(message, dict):
+        legacy_text = first_choice.get("text")
+        if isinstance(legacy_text, str) and legacy_text.strip():
+            response_text = legacy_text.strip()
+        else:
+            if logger_instance:
+                logger_instance.error(
+                    "[%s] Choice missing message object: choice_keys=%s finish_reason=%s",
+                    req_id,
+                    list(first_choice.keys()),
+                    finish_reason,
+                )
+            return None, {}, "Missing message in model choice"
+    else:
+        raw_content = message.get("content")
+        has_reasoning = bool(message.get("reasoning")) or ("reasoning" in message)
+        message_keys = list(message.keys())
+
+        if isinstance(raw_content, str):
+            cleaned = raw_content.strip()
+            if cleaned:
+                response_text = cleaned
+        elif isinstance(raw_content, list):
+            # Handle array of content blocks e.g. [{"type": "text", "text": "..."}]
+            text_parts = []
+            for block in raw_content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text" and isinstance(block.get("text"), str):
+                        text_parts.append(block["text"])
+                    elif "text" in block and isinstance(block["text"], str):
+                        text_parts.append(block["text"])
+                elif isinstance(block, str):
+                    text_parts.append(block)
+            combined = "".join(text_parts).strip()
+            if combined:
+                response_text = combined
+
+        # Support reasoning text fallback for reasoning models (e.g. DeepSeek v4.1 Flash)
+        # where content may be null/empty while reasoning contains the generated response.
+        if not response_text and isinstance(message.get("reasoning"), str):
+            cleaned_reasoning = message["reasoning"].strip()
+            if cleaned_reasoning:
+                if logger_instance:
+                    logger_instance.info("[%s] Using reasoning fallback for model response text", req_id)
+                response_text = cleaned_reasoning
+
+        if not response_text:
+            if logger_instance:
+                logger_instance.error(
+                    "[%s] No valid text in message: top_keys=%s msg_keys=%s content_type=%s finish_reason=%s has_reasoning=%s",
+                    req_id,
+                    list(result.keys()),
+                    message_keys,
+                    type(raw_content).__name__,
+                    finish_reason,
+                    has_reasoning,
+                )
+            return None, {}, "No valid model response text"
+
+    # Enforce maximum text cap (65,536 bytes) safely
+    if response_text:
+        encoded = response_text.encode("utf-8")
+        if len(encoded) > 65536:
+            response_text = encoded[:65000].decode("utf-8", errors="ignore")
+
+    # Normalize usage
+    provider_usage = result.get("usage", {})
+    if not isinstance(provider_usage, dict):
+        provider_usage = {}
+
+    usage = {}
+    mapping = {
+        "prompt_tokens": "input_tokens",
+        "completion_tokens": "output_tokens",
+    }
+
+    for source, target in mapping.items():
+        value = provider_usage.get(source)
+        if type(value) is int and 0 <= value <= 1000000000:
+            usage[target] = value
+
+    if "input_tokens" in usage and "output_tokens" in usage:
+        usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
+    elif "total_tokens" in provider_usage and type(provider_usage["total_tokens"]) is int:
+        usage["total_tokens"] = provider_usage["total_tokens"]
+
+    return response_text, usage, None
 
 
 # --------------------------------------------------
@@ -83,6 +237,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
     # --------------------------------------------------
 
     def do_POST(self):
+        req_id = uuid.uuid4().hex[:8]
+        start_time = time.monotonic()
 
         try:
 
@@ -102,6 +258,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 supplied_token,
                 "Bearer " + expected_token,
             ):
+                logger.warning("[%s] 403 Forbidden: Invalid bearer token supplied", req_id)
                 self.send_json(403, {"error": "Forbidden"})
                 return
 
@@ -131,7 +288,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
             # 3. Parse request
 
-            frame = json.loads(raw_body)
+            try:
+                frame = json.loads(raw_body)
+            except Exception:
+                self.send_json(400, {"error": "Invalid JSON in request"})
+                return
 
             if not isinstance(frame, dict):
                 self.send_json(400, {"error": "Invalid JSON object"})
@@ -159,7 +320,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             for message in messages:
 
                 if not isinstance(message, dict):
-                    self.send_json(400, {"error": "Invalid message"})
+                    self.send_json(400, {"error": "Invalid message structure"})
                     return
 
                 if set(message) != {"role", "content"}:
@@ -170,11 +331,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 content = message["content"]
 
                 if role not in allowed_roles:
-                    self.send_json(400, {"error": "Invalid message role"})
+                    self.send_json(400, {"error": "Invalid role"})
                     return
 
-                if not isinstance(content, str):
-                    self.send_json(400, {"error": "Invalid message content"})
+                if not isinstance(content, str) or not content:
+                    self.send_json(400, {"error": "Empty message content"})
+                    return
+
+                if len(content.encode("utf-8")) > 16384:
+                    self.send_json(400, {"error": "Message content too large"})
                     return
 
                 if role != "system":
@@ -233,10 +398,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             )
 
             logger.info(
-                "Inference started: model=%s messages=%d bytes=%d tokens=%d",
+                "[%s] Calling provider: model=%s max_tokens=%d",
+                req_id,
                 model,
-                len(messages),
-                len(provider_body),
                 max_tokens,
             )
 
@@ -260,9 +424,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 )
 
                 logger.error(
-                    "Provider HTTP error: status=%d body=%s",
+                    "[%s] Provider HTTP error: duration=%.2fs status=%d body=%s",
+                    req_id,
+                    time.monotonic() - start_time,
                     exc.code,
-                    error_body[:1000],
+                    error_body[:500],
                 )
 
                 self.send_json(
@@ -274,7 +440,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             except (URLError, TimeoutError, socket.timeout) as exc:
 
                 logger.error(
-                    "Provider connection error: %s",
+                    "[%s] Provider connection error: duration=%.2fs type=%s",
+                    req_id,
+                    time.monotonic() - start_time,
                     type(exc).__name__,
                 )
 
@@ -288,7 +456,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
             if len(raw) > 131072:
 
-                logger.error("Provider response too large")
+                logger.error("[%s] Provider response too large: bytes=%d", req_id, len(raw))
 
                 self.send_json(
                     502,
@@ -301,172 +469,24 @@ class GatewayHandler(BaseHTTPRequestHandler):
             try:
                 result = json.loads(raw)
             except Exception:
-                logger.error("Failed to parse provider response as JSON")
+                logger.error("[%s] Failed to parse provider response as JSON", req_id)
                 self.send_json(
                     502,
                     {"error": "Invalid JSON from model provider"},
                 )
                 return
 
-            if not isinstance(result, dict):
-                logger.error(
-                    "Provider JSON is not an object: type=%s",
-                    type(result).__name__,
-                )
-                self.send_json(
-                    502,
-                    {"error": "Invalid provider response structure"},
-                )
+            response_text, usage, error_reason = extract_model_output(
+                result,
+                logger_instance=logger,
+                req_id=req_id,
+            )
+
+            if error_reason:
+                self.send_json(502, {"error": error_reason})
                 return
 
-            # Check if provider returned an error payload inside the body
-            if "error" in result:
-                err = result.get("error")
-                err_code = err.get("code") if isinstance(err, dict) else None
-                err_msg = (
-                    err.get("message", "unknown")
-                    if isinstance(err, dict)
-                    else str(err)
-                )
-                logger.error(
-                    "Provider error in payload: code=%s message=%s",
-                    err_code,
-                    err_msg[:200],
-                )
-                self.send_json(
-                    502,
-                    {"error": "Model provider returned an error"},
-                )
-                return
-
-            choices = result.get("choices")
-            if not isinstance(choices, list) or not choices:
-                logger.error(
-                    "Missing or empty choices in provider response: top_keys=%s",
-                    list(result.keys()),
-                )
-                self.send_json(
-                    502,
-                    {"error": "Missing choices in model response"},
-                )
-                return
-
-            first_choice = choices[0]
-            if not isinstance(first_choice, dict):
-                logger.error(
-                    "First choice is not an object: type=%s",
-                    type(first_choice).__name__,
-                )
-                self.send_json(
-                    502,
-                    {"error": "Invalid choice structure in model response"},
-                )
-                return
-
-            finish_reason = first_choice.get("finish_reason")
-            message = first_choice.get("message")
-
-            if not isinstance(message, dict):
-                legacy_text = first_choice.get("text")
-                if isinstance(legacy_text, str) and legacy_text.strip():
-                    response_text = legacy_text.strip()
-                else:
-                    logger.error(
-                        "Choice missing message object: choice_keys=%s finish_reason=%s",
-                        list(first_choice.keys()),
-                        finish_reason,
-                    )
-                    self.send_json(
-                        502,
-                        {"error": "Missing message in model choice"},
-                    )
-                    return
-            else:
-                raw_content = message.get("content")
-                has_reasoning = bool(message.get("reasoning")) or ("reasoning" in message)
-                message_keys = list(message.keys())
-
-                response_text = None
-                if isinstance(raw_content, str):
-                    cleaned = raw_content.strip()
-                    if cleaned:
-                        response_text = cleaned
-                elif isinstance(raw_content, list):
-                    # Handle array of content blocks e.g. [{"type": "text", "text": "..."}]
-                    text_parts = []
-                    for block in raw_content:
-                        if isinstance(block, dict):
-                            if block.get("type") == "text" and isinstance(block.get("text"), str):
-                                text_parts.append(block["text"])
-                            elif "text" in block and isinstance(block["text"], str):
-                                text_parts.append(block["text"])
-                        elif isinstance(block, str):
-                            text_parts.append(block)
-                    combined = "".join(text_parts).strip()
-                    if combined:
-                        response_text = combined
-
-                # Support reasoning text fallback for reasoning models (e.g. DeepSeek v4.1 Flash)
-                # where content may be null/empty while reasoning contains the generated response.
-                if not response_text and isinstance(message.get("reasoning"), str):
-                    cleaned_reasoning = message["reasoning"].strip()
-                    if cleaned_reasoning:
-                        logger.info("Using reasoning fallback for model response text")
-                        response_text = cleaned_reasoning
-
-                if response_text:
-                    encoded = response_text.encode("utf-8")
-                    if len(encoded) > 65536:
-                        response_text = encoded[:65500].decode("utf-8", errors="ignore")
-
-                if not response_text:
-                    logger.error(
-                        "No valid text in message: top_keys=%s msg_keys=%s content_type=%s finish_reason=%s has_reasoning=%s",
-                        list(result.keys()),
-                        message_keys,
-                        type(raw_content).__name__,
-                        finish_reason,
-                        has_reasoning,
-                    )
-                    self.send_json(
-                        502,
-                        {"error": "No valid model response text"},
-                    )
-                    return
-
-            # 10. Normalize usage
-
-            provider_usage = result.get("usage", {})
-
-            if not isinstance(provider_usage, dict):
-                provider_usage = {}
-
-            usage = {}
-
-            mapping = {
-                "prompt_tokens": "input_tokens",
-                "completion_tokens": "output_tokens",
-            }
-
-            for source, target in mapping.items():
-
-                value = provider_usage.get(source)
-
-                if (
-                    type(value) is int
-                    and 0 <= value <= 1000000000
-                ):
-                    usage[target] = value
-
-            if (
-                "input_tokens" in usage
-                and "output_tokens" in usage
-            ):
-                usage["total_tokens"] = (
-                    usage["input_tokens"] + usage["output_tokens"]
-                )
-
-            # 11. Return competition-compatible response
+            # 10. Return competition-compatible response
 
             output = {
                 "text": response_text,
@@ -474,7 +494,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
             }
 
             logger.info(
-                "Inference completed: input=%s output=%s",
+                "[%s] Inference completed: model=%s duration=%.2fs input=%s output=%s",
+                req_id,
+                model,
+                time.monotonic() - start_time,
                 usage.get("input_tokens", "unknown"),
                 usage.get("output_tokens", "unknown"),
             )
@@ -483,12 +506,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
         except (BrokenPipeError, ConnectionResetError):
 
-            logger.warning("Client disconnected")
+            logger.warning("[%s] Client disconnected", req_id)
 
         except Exception as exc:
 
             logger.exception(
-                "Unexpected gateway exception: %s",
+                "[%s] Unexpected gateway exception: duration=%.2fs type=%s",
+                req_id,
+                time.monotonic() - start_time,
                 type(exc).__name__,
             )
 
